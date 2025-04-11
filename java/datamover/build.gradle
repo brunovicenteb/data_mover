@@ -1,0 +1,22 @@
+plugins {
+    id 'java'
+}
+
+group = 'ai.tonic'
+version = '1.0-SNAPSHOT'
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    testImplementation platform('org.junit:junit-bom:5.10.0')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    implementation 'com.google.guava:guava:33.2.0-jre'
+    implementation 'org.tomlj:tomlj:1.1.1'
+    implementation group: 'org.postgresql', name: 'postgresql', version: '42.7.3'
+}
+
+test {
+    useJUnitPlatform()
+}

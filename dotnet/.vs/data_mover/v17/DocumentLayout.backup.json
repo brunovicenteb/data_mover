@@ -1,0 +1,49 @@
+{
+  "Version": 1,
+  "WorkspaceRootPath": "C:\\Fontes\\Test\\data_mover-main\\dotnet\\",
+  "Documents": [
+    {
+      "AbsoluteMoniker": "D:0:0:{AB5925CA-3ACB-4D95-A08B-FA099A213359}|data_mover\\data_mover.csproj|c:\\fontes\\test\\data_mover-main\\dotnet\\data_mover\\program.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{AB5925CA-3ACB-4D95-A08B-FA099A213359}|data_mover\\data_mover.csproj|solutionrelative:data_mover\\program.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    }
+  ],
+  "DocumentGroupContainers": [
+    {
+      "Orientation": 0,
+      "VerticalTabListWidth": 256,
+      "DocumentGroups": [
+        {
+          "DockedWidth": 200,
+          "SelectedChildIndex": 3,
+          "Children": [
+            {
+              "$type": "Bookmark",
+              "Name": "ST:129:0:{116d2292-e37d-41cd-a077-ebacac4c8cc4}"
+            },
+            {
+              "$type": "Bookmark",
+              "Name": "ST:131:0:{116d2292-e37d-41cd-a077-ebacac4c8cc4}"
+            },
+            {
+              "$type": "Bookmark",
+              "Name": "ST:130:0:{116d2292-e37d-41cd-a077-ebacac4c8cc4}"
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 0,
+              "Title": "Program.cs",
+              "DocumentMoniker": "C:\\Fontes\\Test\\data_mover-main\\dotnet\\data_mover\\Program.cs",
+              "RelativeDocumentMoniker": "data_mover\\Program.cs",
+              "ToolTip": "C:\\Fontes\\Test\\data_mover-main\\dotnet\\data_mover\\Program.cs",
+              "RelativeToolTip": "data_mover\\Program.cs",
+              "ViewState": "AgIAADIAAAAAAAAAAADwv0gAAAAMAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2025-04-11T20:02:49.307Z",
+              "EditorCaption": ""
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

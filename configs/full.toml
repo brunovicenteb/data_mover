@@ -1,0 +1,97 @@
+[source]
+host = "localhost"
+port = 5432
+database = "source"
+user = "postgres"
+password = ""
+
+[destination]
+host = "localhost"
+port = 5432
+database = "destination"
+user = "postgres"
+password = ""
+
+[[table]]
+schemaName = "public"
+tableName = "large"
+
+[[table]]
+schemaName = "public"
+tableName = "medium1"
+
+[[table]]
+schemaName = "public"
+tableName = "medium2"
+
+[[table]]
+schemaName = "public"
+tableName = "medium3"
+
+[[table]]
+schemaName = "public"
+tableName = "small1"
+
+[[table]]
+schemaName = "public"
+tableName = "small2"
+
+[[table]]
+schemaName = "public"
+tableName = "small3"
+
+[[table]]
+schemaName = "public"
+tableName = "small4"
+
+# large columns
+[[column]]
+schemaName = "public"
+tableName = "large"
+columnName = "labeltypename"
+processor = "HelloWorld"
+
+[[column]]
+schemaName = "public"
+tableName = "large"
+columnName = "label"
+processor = "Encryption"
+
+# medium columns
+[[column]]
+schemaName = "public"
+tableName = "medium1"
+columnName = "labeltypename"
+processor = "HelloWorld"
+
+[[column]]
+schemaName = "public"
+tableName = "medium1"
+columnName = "label"
+processor = "Encryption"
+
+[[column]]
+schemaName = "public"
+tableName = "medium2"
+columnName = "labeltypename"
+processor = "Encryption"
+
+[[column]]
+schemaName = "public"
+tableName = "medium2"
+columnName = "label"
+processor = "Encryption"
+
+# small columns
+[[column]]
+schemaName = "public"
+tableName = "small1"
+columnName = "labeltypename"
+processor = "HelloWorld"
+
+[[column]]
+schemaName = "public"
+tableName = "small1"
+columnName = "label"
+processor = "HelloWorld"
+

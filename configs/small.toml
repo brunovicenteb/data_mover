@@ -1,0 +1,42 @@
+[source]
+host = "localhost"
+port = 5432
+database = "source"
+user = "postgres"
+password = ""
+
+[destination]
+host = "localhost"
+port = 5432
+database = "destination"
+user = "postgres"
+password = ""
+
+[[table]]
+schemaName = "public"
+tableName = "small1"
+# limit = 500
+
+[[table]]
+schemaName = "public"
+tableName = "small2"
+
+[[table]]
+schemaName = "public"
+tableName = "small3"
+
+[[table]]
+schemaName = "public"
+tableName = "small4"
+
+[[column]]
+schemaName = "public"
+tableName = "small1"
+columnName = "labeltypename"
+processor = "HelloWorld"
+
+[[column]]
+schemaName = "public"
+tableName = "small1"
+columnName = "label"
+processor = "Encryption"
