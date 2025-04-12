@@ -1,9 +1,11 @@
-﻿using System.Collections.Frozen;
-using System.Collections.Immutable;
-using System.Diagnostics;
-using data_mover.ColumnProcessors;
+﻿using data_mover.ColumnProcessors;
 using Npgsql;
 using Npgsql.Schema;
+using System.Collections.Frozen;
+using System.Collections.Immutable;
+using System.Data;
+using System.Diagnostics;
+using System.Text;
 using Tomlyn;
 using Tomlyn.Model;
 
@@ -11,6 +13,8 @@ namespace data_mover;
 
 static class Program
 {
+    private const int BATCH_MAX_SIZE = 1_000;
+
     public static int Main(string[] args)
     {
         var config = ReadConfig(args);
@@ -39,40 +43,52 @@ static class Program
     private static void ProcessTables(IReadOnlyList<TableConfiguration> tablesToProcess, IReadOnlyDictionary<DatabaseColumn, IColumnProcessor> columnsToProcess, DbConfig sourceDbConfig, DbConfig destinationDbConfig)
     {
         var totalStopWatch = Stopwatch.StartNew();
-        foreach (var table in tablesToProcess)
+        var parallelOptions = new ParallelOptions
         {
-            var columns = columnsToProcess.Where(c => c.Key.Table == table.Table).ToFrozenDictionary();
-            ProcessTable(table, columns, sourceDbConfig, destinationDbConfig);
-        }
+            MaxDegreeOfParallelism = Environment.ProcessorCount - 1
+        };
+
+        var task = Task.Run(async () =>
+         {
+             await Parallel.ForEachAsync(tablesToProcess, parallelOptions, async (table, cancellationToken) =>
+             {
+                 var columns = columnsToProcess
+                     .Where(c => c.Key.Table == table.Table)
+                     .ToFrozenDictionary();
+
+                 await ProcessTableAsync(table, columns, sourceDbConfig, destinationDbConfig);
+             });
+         });
+        task.Wait();
+
         Console.WriteLine("Total time processing tables: " + totalStopWatch.Elapsed.TotalSeconds + "s");
     }
 
-    private static void ProcessTable(TableConfiguration table, IReadOnlyDictionary<DatabaseColumn, IColumnProcessor> columnsToProcess, DbConfig sourceDbConfig, DbConfig destinationDbConfig)
+    private static async Task ProcessTableAsync(TableConfiguration table, IReadOnlyDictionary<DatabaseColumn, IColumnProcessor> columnsToProcess, DbConfig sourceDbConfig, DbConfig destinationDbConfig)
     {
         using var sourceConnection = sourceDbConfig.Connection();
-        sourceConnection.Open();
+        await sourceConnection.OpenAsync();
         using var destinationConnection = destinationDbConfig.Connection();
-        destinationConnection.Open();
+        await destinationConnection.OpenAsync();
 
         var query = table.Limit is null
             ? "SELECT * FROM " + table.Table
             : "SELECT * FROM " + table.Table + " LIMIT " + table.Limit;
         using var readCommand = sourceConnection.CreateCommand();
         readCommand.CommandText = query;
-        using var reader = readCommand.ExecuteReader();
+        using var reader = await readCommand.ExecuteReaderAsync();
         var tablesColumns = reader.GetColumnSchema().ToImmutableArray();
 
         Console.WriteLine($"Starting table {table.Table}.");
         long count = 0;
         var sinceLastReport = Stopwatch.StartNew();
         var totalTime = Stopwatch.StartNew();
-        while (reader.Read())
+        var batch = new List<Dictionary<string, object>>();
+        while (await reader.ReadAsync())
         {
-            var row = ReadRow(reader, tablesColumns); // Task 1
-            ProcessRow(row, columnsToProcess); // Task 2
-            WriteRow(row, table.Table, tablesColumns, destinationConnection); // Task 3 this one should be reimplemented to use a batch of rows instead a single row
-            // acolombi (acolombi@gmail.com)
-
+            var row = ReadRow(reader, tablesColumns);
+            ProcessRow(row, columnsToProcess);
+            await WriteRowAsync(row, table.Table, destinationConnection, batch);
             count += 1;
             if (sinceLastReport.Elapsed.TotalSeconds > 10)
             {
@@ -80,18 +96,17 @@ static class Program
                 sinceLastReport.Restart();
             }
         }
+        await FlushAsync(table.Table, destinationConnection, batch);
         Console.WriteLine($"Table {table} processed in: " + totalTime.Elapsed.TotalSeconds + "s");
     }
 
     private static Dictionary<string, object> ReadRow(NpgsqlDataReader reader, IReadOnlyList<NpgsqlDbColumn> columns)
     {
         var retval = new Dictionary<string, object>(columns.Count);
+        var values = new object[columns.Count];
+        reader.GetValues(values);
         foreach (var column in columns)
-        {
-            int ordinal = (int) column.ColumnOrdinal!;
-            retval[column.ColumnName] = reader.GetValue(ordinal);
-        }
-
+            retval[column.ColumnName] = values[column.ColumnOrdinal!.Value];
         return retval;
     }
 
@@ -104,25 +119,47 @@ static class Program
         }
     }
 
-    private static void WriteRow(Dictionary<string, object> row, DatabaseTable table, IReadOnlyList<NpgsqlDbColumn> columns, NpgsqlConnection destinationConnection)
+    private static async Task WriteRowAsync(Dictionary<string, object> row, DatabaseTable table, NpgsqlConnection destinationConnection, List<Dictionary<string, object>> batch)
     {
-        using var command = destinationConnection.CreateCommand();
-        var parameterNames = string.Join(", ", Enumerable.Range(1, row.Count).Select(x => $"${x}"));
-        command.CommandText = "INSERT INTO " + table + $" VALUES ({parameterNames})";
+        batch.Add(row);
+        if (batch.Count >= BATCH_MAX_SIZE)
+            await FlushAsync(table, destinationConnection, batch);
+    }
 
-        foreach (var column in columns)
+    private static async Task FlushAsync(DatabaseTable table, NpgsqlConnection destinationConnection, List<Dictionary<string, object>> batch)
+    {
+        if (batch.Count == 0)
+            return;
+
+        int paramIndex = -1;
+        var commandText = new StringBuilder();
+        var parameters = new List<NpgsqlParameter>();
+
+        foreach (var row in batch)
         {
-            var parameter = command.CreateParameter();
-            parameter.Value = row[column.ColumnName];
-            command.Parameters.Add(parameter);
+            var parCount = -1;
+            var pars = new string[row.Count];
+            foreach (var dataRow in row)
+            {
+                parCount++;
+                paramIndex++;
+                pars[parCount] = $"@p{paramIndex}";
+                parameters.Add(new NpgsqlParameter($"@p{paramIndex}", dataRow.Value));
+            }
+            var rowPars = string.Join(",", pars);
+            commandText.AppendLine($"INSERT INTO {table} VALUES ({rowPars});");
         }
+
+        using var command = destinationConnection.CreateCommand();
+        command.CommandText = commandText.ToString();
+        command.Parameters.AddRange(parameters.ToArray());
         command.Prepare();
 
-        var result = command.ExecuteNonQuery();
-        if (result != 1)
-        {
-            throw new InvalidOperationException("No rows inserted!");
-        }
+        var result = await command.ExecuteNonQueryAsync();
+        if (result != batch.Count)
+            throw new InvalidOperationException("Wrong rows ammount inserted!");
+
+        batch.Clear();
     }
 
     private static void TruncateDestinationDatabaseTables(IReadOnlyList<TableConfiguration> tablesToProcess, DbConfig destinationDbConfig)
