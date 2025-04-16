@@ -15,8 +15,11 @@ public record DataBatch(DatabaseTable Table, IReadOnlyList<Dictionary<string, ob
 
 static class Program
 {
-    private const int BatchSize = 1000;
-    private const int MaxDegreeOfParallelism = 4;
+    private const int WRITE_BATCH_SIZE = 1000;
+    private const int READ_PAGE_SIZE = 10000;
+    private const int MAX_DEGREE_OF_PARALLELISM = 4;
+    private const int MAX_READER_TASKS = 4;
+    private const string DEFAULT_PK_NAME = "_label_key";
 
     public static async Task<int> Main(string[] args)
     {
@@ -65,7 +68,7 @@ static class Program
         Console.WriteLine($"Starting processing table {tableConfig.Table}");
 
         // Channel for raw data (reading -> processing)
-        var rawDataChannel = CreateChannel<Dictionary<string, object>>(100, true);
+        var rawDataChannel = CreateChannel<Dictionary<string, object>>(1000, true);
 
         // Channel for processed data (processing -> writing)
         var processedDataChannel = CreateChannel<DataBatch>(10, false);
@@ -73,63 +76,146 @@ static class Program
         // Start pipeline
         var readTask = ReadFromSourceAsync(tableConfig, sourceDbConfig, rawDataChannel.Writer);
 
-        var processTasks = Enumerable.Range(0, MaxDegreeOfParallelism)
+        var processTasks = Enumerable.Range(0, MAX_DEGREE_OF_PARALLELISM)
             .Select(_ => ProcessDataAsync(tableConfig.Table, rawDataChannel.Reader, processedDataChannel.Writer, columnsToProcess))
             .ToArray();
 
         var writeTask = WriteToDestinationAsync(tableConfig.Table, destinationDbConfig, processedDataChannel.Reader);
 
-        // Wait for steps to complete
         await readTask; // Ensures reading completion
-        /* Console.Write("TODA A LEITURA COMPLETA."); */
 
         await Task.WhenAll(processTasks); // Ensures completion of processing
-        processedDataChannel.Writer.Complete(); // // Sending remaining batches
-        /* Console.Write("TODA O PROCESSAMENTO COMPLETO."); */
+        processedDataChannel.Writer.Complete();
 
         await writeTask; // Ensures writing completion
-        /* Console.Write("TODA A ESCRITA COMPLETA."); */
 
         Console.WriteLine($"Finished processing table {tableConfig.Table}");
     }
 
     private static async Task ReadFromSourceAsync(TableConfiguration tableConfig, DbConfig dbConfig, ChannelWriter<Dictionary<string, object>> output)
     {
+        var primaryKey = await GetPrimaryKeyColumnAsync(tableConfig, dbConfig);
+        if (primaryKey == null)
+        {
+            Console.WriteLine($"Warning: No primary key found for table {tableConfig.Table}, falling back to offset pagination");
+            return;
+        }
+
+        var (minId, maxId) = await GetMinMaxIdsAsync(tableConfig, dbConfig, primaryKey);
+
+        // If the table is empty
+        if (minId == null || maxId == null)
+        {
+            output.Complete();
+            return;
+        }
+
+        // Split the range of IDs between the tasks
+        // I made some tests and if we increase a lot the MAX_READER_TASKS const with a small Postgres, the DB don't suport too many threads.
+        var ranges = SplitIdRange(minId, maxId, MAX_READER_TASKS); 
+
+        Console.WriteLine($"Processing {tableConfig.Table} using keyset pagination on column {primaryKey}");
+
+        var readTasks = ranges.Select(range => Task.Run(() => ReadIdRangeAsync(
+                tableConfig, dbConfig, output, primaryKey, range.Start, range.End)));
+
+        await Task.WhenAll(readTasks);
+        output.Complete();
+    }
+
+    private static async Task ReadIdRangeAsync(TableConfiguration tableConfig, DbConfig dbConfig, ChannelWriter<Dictionary<string, object>> output, string primaryKey, object rangeStart, object rangeEnd)
+    {
         await using var connection = dbConfig.Connection();
         await connection.OpenAsync();
 
-        var query = tableConfig.Limit is null
-            ? $"SELECT * FROM {tableConfig.Table}"
-            : $"SELECT * FROM {tableConfig.Table} LIMIT {tableConfig.Limit}";
+        var baseQuery = tableConfig.Limit is null
+            ? $"SELECT * FROM {tableConfig.Table} WHERE {primaryKey} > @start AND {primaryKey} <= @end ORDER BY {primaryKey}"
+            : $"SELECT * FROM {tableConfig.Table} WHERE {primaryKey} > @start AND {primaryKey} <= @end ORDER BY {primaryKey} LIMIT {tableConfig.Limit}";
 
-        await using var command = new NpgsqlCommand(query, connection);
-        await using var reader = await command.ExecuteReaderAsync();
+        object lastId = rangeStart;
+        bool hasMoreData = true;
 
-        var columns = (await reader.GetColumnSchemaAsync()).ToImmutableArray();
-        var count = 0L;
-        var timer = Stopwatch.StartNew();
-        var lastReport = Stopwatch.StartNew();
-
-        try
+        while (hasMoreData)
         {
+            await using var command = new NpgsqlCommand(baseQuery, connection);
+            command.Parameters.AddWithValue("@start", lastId);
+            command.Parameters.AddWithValue("@end", rangeEnd);
+
+            await using var reader = await command.ExecuteReaderAsync();
+            var columns = (await reader.GetColumnSchemaAsync()).ToImmutableArray();
+
+            int pageCount = 0;
             while (await reader.ReadAsync())
             {
                 var row = ReadRow(reader, columns);
                 await output.WriteAsync(row);
-
-                count++;
-                if (lastReport.Elapsed.TotalSeconds > 10)
-                {
-                    Console.WriteLine($"Read {count} rows from {tableConfig.Table} in {timer.Elapsed.TotalSeconds}s");
-                    lastReport.Restart();
-                }
+                lastId = row[primaryKey];
+                pageCount++;
             }
+
+            hasMoreData = pageCount >= READ_PAGE_SIZE;
         }
-        finally
+    }
+
+    private static List<(object Start, object End)> SplitIdRange(object minId, object maxId, int partitions)
+    {
+        var ranges = new List<(object, object)>();
+
+        if (minId is not IComparable)
+            throw new NotSupportedException("Keyset pagination only supports comparable types (numbers, dates)");
+
+        dynamic rangeSize = ((dynamic)maxId - (dynamic)minId) / partitions;
+        dynamic current = minId;
+
+        for (int i = 0; i < partitions; i++)
         {
-            output.Complete();
-            Console.WriteLine($"Finished reading {count} rows from {tableConfig.Table} in {timer.Elapsed.TotalSeconds}s");
+            dynamic rangeStart = i == 0 ? current - 1 : current;
+            dynamic rangeEnd = (i == partitions - 1) ? maxId : current + rangeSize;
+            ranges.Add((rangeStart, rangeEnd));
+            current = rangeEnd;
         }
+
+        return ranges;
+    }
+
+    private static async Task<(object minId, object maxId)> GetMinMaxIdsAsync(TableConfiguration tableConfig, DbConfig dbConfig, string primaryKey)
+    {
+        await using var connection = dbConfig.Connection();
+        await connection.OpenAsync();
+
+        var query = tableConfig.Limit is null
+            ? $"SELECT MIN({primaryKey}), MAX({primaryKey}) FROM {tableConfig.Table}"
+            : $"SELECT MIN({primaryKey}), MAX({primaryKey}) FROM (SELECT {primaryKey} FROM {tableConfig.Table} LIMIT {tableConfig.Limit}) AS subquery";
+
+        await using var command = new NpgsqlCommand(query, connection);
+        await using var reader = await command.ExecuteReaderAsync();
+
+        if (await reader.ReadAsync())
+        {
+            return (reader.IsDBNull(0) ? null! : reader.GetValue(0),
+                    reader.IsDBNull(1) ? null! : reader.GetValue(1));
+        }
+
+        return (null!, null!);
+    }
+
+    private static async Task<string?> GetPrimaryKeyColumnAsync(TableConfiguration tableConfig, DbConfig dbConfig)
+    {
+        await using var connection = dbConfig.Connection();
+        await connection.OpenAsync();
+
+        var query = $@"SELECT a.attname FROM pg_index i
+            JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+            WHERE i.indrelid = to_regclass($1)
+            AND i.indisprimary";
+
+        await using var command = new NpgsqlCommand(query, connection);
+        command.Parameters.AddWithValue(tableConfig.Table.ToString());
+
+        await using var reader = await command.ExecuteReaderAsync();
+
+        // This dummy default key is because we don't have any PK on example tables.
+        return await reader.ReadAsync() ? reader.GetString(0) : DEFAULT_PK_NAME;
     }
 
     private static Dictionary<string, object> ReadRow(NpgsqlDataReader reader, IReadOnlyList<NpgsqlDbColumn> columns)
@@ -146,14 +232,14 @@ static class Program
     private static async Task ProcessDataAsync(DatabaseTable table, ChannelReader<Dictionary<string, object>> input, ChannelWriter<DataBatch> output,
         IReadOnlyDictionary<DatabaseColumn, IColumnProcessor> columnsToProcess)
     {
-        var batch = new List<Dictionary<string, object>>(BatchSize);
+        var batch = new List<Dictionary<string, object>>(WRITE_BATCH_SIZE);
 
         await foreach (var row in input.ReadAllAsync())
         {
             ProcessRow(row, columnsToProcess);
             batch.Add(row);
 
-            if (batch.Count >= BatchSize)
+            if (batch.Count >= WRITE_BATCH_SIZE)
             {
                 await output.WriteAsync(new DataBatch(table, batch.ToArray()));
                 batch.Clear();
@@ -221,13 +307,9 @@ static class Program
         var result = await command.ExecuteNonQueryAsync();
         if (result != batch.Rows.Count)
             throw new InvalidOperationException("Wrong rows ammount inserted!");
-
-        //Console.WriteLine($"Writed {batch.Rows.Count} rows from {table.Table}");
     }
 
-    private static async Task TruncateDestinationDatabaseTablesAsync(
-        IReadOnlyList<TableConfiguration> tablesToProcess,
-        DbConfig destinationDbConfig)
+    private static async Task TruncateDestinationDatabaseTablesAsync(IReadOnlyList<TableConfiguration> tablesToProcess, DbConfig destinationDbConfig)
     {
         var truncateTasks = tablesToProcess.Select(table =>
             TruncateTableAsync(table.Table, destinationDbConfig));
